@@ -1,0 +1,14 @@
+# VRT backend dependencies
+# Version floors (>=) rather than hard pins so pip installs prebuilt wheels
+# for whatever Python you have (3.11-3.13+). The old exact pins had no wheels
+# for Python 3.13 and tried to compile from source (needs Visual Studio).
+#
+# pandas removed: not imported anywhere in the backend.
+# scipy IS required - audio_handler.py reads WAV files with scipy.io.wavfile.
+
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+openpyxl>=3.1.2
+numpy>=2.1.0
+scipy>=1.14.1
+python-multipart>=0.0.9

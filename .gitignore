@@ -1,0 +1,41 @@
+# ── Node / frontend ────────────────────────────────────
+node_modules/
+frontend/node_modules/
+*.log
+npm-debug.log*
+
+# ── Python ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# ── Secrets / local env ────────────────────────────────
+.env
+*.env
+!start_local.bat        # keep the launcher (sets env vars for local runs)
+
+# ── RESEARCH DATA - NEVER COMMIT ───────────────────────
+# The app reads/writes children's research data. None of it belongs on GitHub.
+*.wav
+*.xlsx
+*.xlsm
+*.xls
+*.csv
+*.lock                  # scoring-log .lock sidecars
+v5_data/
+v4_data/
+Data_Scoring/
+Data_Scoring_MATLAB/
+
+# ── Project context / notes - not for the repo ────────
+CLAUDE.md
+
+# ── OS / editor cruft ──────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
