@@ -22,6 +22,7 @@ const API = "";  // same origin; Vite proxy routes /api → FastAPI in dev
 async function apiFetch(path, opts = {}) {
   const res = await fetch(API + path, {
     headers: { "Content-Type": "application/json" },
+    cache: "no-store",   // always hit the server so dashboards show live data
     ...opts,
   });
   if (!res.ok) {
@@ -892,6 +893,11 @@ function ScorerScreen({session,run,trialIdx,trialData,totalTrials,onLoadTrial,on
               {!revealed&&<span style={{fontSize:11,color:T.text3}}>click to reveal</span>}
             </div>
           </div>
+          {trialData && !trialData.wav_exists &&
+            <div style={{padding:"8px 16px",background:T.amberD,borderBottom:`0.5px solid ${T.amberB}`,
+              fontSize:12,color:"#F5B84A"}}>
+              No audio file found for this trial - it may not have been recorded. You can still score it as No response or Unsure.
+            </div>}
           <WaveCanvas
             samples={samples}
             startPct={startPct}
@@ -1127,15 +1133,15 @@ function AnalyticsScreen({data,onLoad}){
       : <>
           <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:14}}>
             <StatCard value={pct(d.total_scored_trials,d.total_planned_trials)}
-              label="Data scored (both reviewers)" color="#6EB3FF"
+              label="Data scored (done by both R1 and R2)" color="#6EB3FF"
               sub={`${d.total_scored_trials} of ${d.total_planned_trials} trials`}/>
             <StatCard value={pct(d.accuracy_agree,d.total_scored_trials)}
-              label="R1-R2 accuracy agreement" color="#4ECFA0"
+              label="Accuracy agreement (R1 and R2 gave the same score)" color="#4ECFA0"
               sub={`${d.accuracy_agree} of ${d.total_scored_trials}`}/>
-            <StatCard value={d.needs_third_coder} label="Need 3rd coder" color="#F5B84A"
+            <StatCard value={d.needs_third_coder} label="Need 3rd coder (R1 and R2 disagree)" color="#F5B84A"
               sub={pct(d.needs_third_coder,d.total_scored_trials)+" of scored"}/>
             <StatCard value={d.vrt_correlation==null?"-":d.vrt_correlation.toFixed(3)}
-              label="R1-R2 VRT agreement (r)" color="#B0A8F5"
+              label="VRT agreement, r (1.0 = identical timing)" color="#B0A8F5"
               sub={`${d.vrt_pairs} VRT pairs`}/>
           </div>
           <Card style={{padding:20}}>
@@ -1143,13 +1149,13 @@ function AnalyticsScreen({data,onLoad}){
             {[
               ["Runs scored by both reviewers", `${d.both_complete_runs} of ${d.total_runs}`],
               ["Trials scored by both reviewers", d.total_scored_trials],
-              ["Accuracy - agree", `${d.accuracy_agree} (${pct(d.accuracy_agree,d.total_scored_trials)})`],
-              ["Accuracy - disagree", `${d.accuracy_disagree} (${pct(d.accuracy_disagree,d.total_scored_trials)})`],
-              ["Both scored 'No response'", `${d.both_no_response} (${pct(d.both_no_response,d.total_scored_trials)})`],
-              ["Both flagged 'Cutoff'", `${d.both_cutoff} (${pct(d.both_cutoff,d.total_scored_trials)})`],
-              ["Trials needing a 3rd coder", `${d.needs_third_coder} (${pct(d.needs_third_coder,d.total_scored_trials)})`],
-              ["VRT pairs compared (R1 & R2 both timed)", d.vrt_pairs],
-              ["R1-R2 VRT correlation (Pearson r)", d.vrt_correlation==null?"-":d.vrt_correlation],
+              ["Accuracy - agree (same Correct / Incorrect / No response)", `${d.accuracy_agree} (${pct(d.accuracy_agree,d.total_scored_trials)})`],
+              ["Accuracy - disagree (went to 3rd coder)", `${d.accuracy_disagree} (${pct(d.accuracy_disagree,d.total_scored_trials)})`],
+              ["Both scored 'No response' (no VRT; counts as incorrect)", `${d.both_no_response} (${pct(d.both_no_response,d.total_scored_trials)})`],
+              ["Both flagged 'Cutoff' (response clipped)", `${d.both_cutoff} (${pct(d.both_cutoff,d.total_scored_trials)})`],
+              ["Trials needing a 3rd coder (any disagreement rule)", `${d.needs_third_coder} (${pct(d.needs_third_coder,d.total_scored_trials)})`],
+              ["VRT pairs compared (trials both reviewers timed)", d.vrt_pairs],
+              ["VRT correlation, Pearson r (1.0 = identical timing)", d.vrt_correlation==null?"-":d.vrt_correlation],
             ].map(([k,v])=>(
               <div key={k} style={{display:"flex",justifyContent:"space-between",padding:"8px 0",
                 borderBottom:`0.5px solid ${T.border}`,fontSize:13}}>

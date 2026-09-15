@@ -34,6 +34,9 @@ Data_Scoring_MATLAB/
 # ── Project context / notes - not for the repo ────────
 CLAUDE.md
 
+# ── Stray scratch file ────────────────────────────────
+.writetest
+
 # ── OS / editor cruft ──────────────────────────────────
 .DS_Store
 Thumbs.db
