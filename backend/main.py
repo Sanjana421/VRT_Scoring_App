@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict
 from config import (
     SCORING_LOG_V5, RECHECKS_LOG_V5,
     SRATE, RESP_WINDOW, RESP_MARK_PROP, WAVEFORM_POINTS,
-    get_wav_path,
+    get_wav_path, PI_PASSCODE,
 )
 from scoring_log import (
     claim_scoring_row, write_reviewer_initials, get_completion_status,
@@ -71,6 +71,7 @@ class SessionStartRequest(BaseModel):
     reviewer_name: str          # full name, e.g. "Jane Smith"
     role: str = "scorer"        # "scorer" | "professor" | "r3"
     version: str = "v5"
+    passcode: str = ""          # required only for the PI/Admin (professor) role
 
 class SessionStartResponse(BaseModel):
     ok: bool
@@ -236,6 +237,10 @@ def session_start(req: SessionStartRequest):
         raise HTTPException(status_code=422, detail="reviewer_name is required")
     if req.role not in ("scorer", "professor", "r3"):
         raise HTTPException(status_code=422, detail="role must be 'scorer', 'professor', or 'r3'")
+
+    # PI/Admin is passcode-protected so not just anyone can pick it from the dropdown.
+    if req.role == "professor" and req.passcode.strip() != PI_PASSCODE:
+        raise HTTPException(status_code=403, detail="Incorrect PI/Admin passcode.")
 
     SESSION.clear()
     SESSION["reviewer_name"] = req.reviewer_name.strip()

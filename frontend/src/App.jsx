@@ -134,11 +134,11 @@ export default function App(){
 
   const clearErr = () => setErr("");
 
-  const handleLogin = useCallback(async (name, role) => {
+  const handleLogin = useCallback(async (name, role, passcode="") => {
     try {
       const r = await apiFetch("/api/session/start", {
         method: "POST",
-        body: JSON.stringify({ reviewer_name: name, role, version: "v5" }),
+        body: JSON.stringify({ reviewer_name: name, role, version: "v5", passcode }),
       });
       setSession({ reviewer_name: r.reviewer_name, initials: r.initials, role });
       setRun(null); setTrialIdx(0); setTrialData(null); setLastSaved(null);
@@ -146,7 +146,8 @@ export default function App(){
       setScreen("dashboard");
       // load status in background
       apiFetch("/api/status").then(setStatus).catch(()=>{});
-    } catch(e) { setErr(e.message); }
+      return true;
+    } catch(e) { setErr(e.message); return false; }
   }, []);
 
   const handleSignOut = useCallback(async () => {
@@ -362,6 +363,7 @@ export default function App(){
 function LoginScreen({onLogin}){
   const[name,setName]=useState("");
   const[role,setRole]=useState("scorer");
+  const[passcode,setPasscode]=useState("");
   const[loading,setLoading]=useState(false);
   const mkInit=n=>{const p=n.trim().split(/\s+/);if(!n.trim())return"";
     return p.length===1?p[0].replace(/[^A-Za-z]/g,"").slice(0,3).toUpperCase():(p[0][0]+(p.find((_,i)=>i>0&&p[i].match(/[A-Za-z]/))?.[0]||"")).toUpperCase();};
@@ -370,8 +372,9 @@ function LoginScreen({onLogin}){
     borderRadius:8,padding:"10px 14px",fontSize:14,color:T.text1,fontFamily:"inherit",outline:"none"};
   const handleSubmit=async()=>{
     if(!name.trim())return;
+    if(role==="professor"&&!passcode.trim())return;
     setLoading(true);
-    await onLogin(name.trim(),role);
+    await onLogin(name.trim(),role,passcode);
     setLoading(false);
   };
   return(
@@ -405,12 +408,21 @@ function LoginScreen({onLogin}){
               <option value="r3">3rd Reviewer</option>
             </select>
           </div>
-          <button onClick={handleSubmit} disabled={!name.trim()||loading}
+          {role==="professor"&&(
+            <div style={{marginBottom:26}}>
+              <label style={{fontSize:12,color:T.text2,display:"block",marginBottom:6}}>PI/Admin passcode</label>
+              <input type="password" value={passcode} onChange={e=>setPasscode(e.target.value)}
+                onKeyDown={e=>e.key==="Enter"&&handleSubmit()}
+                style={inp} placeholder="Required for PI/Admin access" autoComplete="off"/>
+            </div>
+          )}
+          {(() => { const disabled = !name.trim() || loading || (role==="professor" && !passcode.trim());
+          return <button onClick={handleSubmit} disabled={disabled}
             style={{width:"100%",background:T.blue,border:"none",borderRadius:9,padding:13,
-              fontSize:14,fontWeight:600,color:"#fff",cursor:"pointer",fontFamily:"inherit",
-              opacity:(!name.trim()||loading)?0.5:1}}>
+              fontSize:14,fontWeight:600,color:"#fff",cursor:disabled?"not-allowed":"pointer",fontFamily:"inherit",
+              opacity:disabled?0.5:1}}>
             {loading?"Starting...":"Start scoring session →"}
-          </button>
+          </button>; })()}
         </Card>
       </div>
     </div>

@@ -21,6 +21,12 @@ import os
 DATA_ROOT_V5 = r"\\bl-sphs-sphs\gustafsonlab\Projects\DistVRT_v5"
 DATA_ROOT_V4 = r"\\bl-sphs-sphs\gustafsonlab\Projects\DistVRT_v4_SF"
 
+# -- PI/Admin passcode --------------------------------------------------------
+# Required to log in with the PI/Admin role. Change per deployment by setting
+# the VRT_PI_PASSCODE environment variable (e.g. in start.bat); otherwise this
+# default is used.
+PI_PASSCODE = os.environ.get("VRT_PI_PASSCODE") or "CARES_LAB_2026"
+
 # -- Scoring logs (env vars override server paths for local testing) -----------
 SCORING_LOG_V5  = os.environ.get("DISTVRT_SCORING_LOG") \
                   or os.path.join(DATA_ROOT_V5, "DistVRT_v5_DataScoringLog.xlsx")
