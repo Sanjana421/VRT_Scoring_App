@@ -28,9 +28,10 @@ from config import (
 )
 from scoring_log import (
     claim_scoring_row, write_reviewer_initials, get_completion_status,
-    release_scoring_row, compute_initials,
+    release_scoring_row, compute_initials, write_pass_initials,
+    set_lease, clear_lease,
 )
-from subject_data import get_all_trials, read_trial_info
+from subject_data import get_all_trials, read_trial_info, get_run_progress
 from audio_handler import get_waveform_data, get_wav_filepath, wav_exists
 from excel_writer import save_trial
 from r3_log import (
@@ -90,6 +91,9 @@ class AssignRunResponse(BaseModel):
     rev_num: int = 0
     log_row: int = 0
     total_trials: int = 0
+    scored_trials: list = []     # trial_nums already scored for this pass (resume)
+    start_index: int = 0         # 0-based index of the first unscored trial
+    is_resume: bool = False      # True when picking up a partially-scored pass
     message: str = ""
 
 class TrialResponse(BaseModel):
@@ -257,6 +261,8 @@ def session_start(req: SessionStartRequest):
     SESSION["log_row"]   = None
     SESSION["trials"]    = []     # list of trial dicts from get_all_trials
     SESSION["current_trial_idx"] = 0
+    SESSION["scored_trials"]  = []      # trial_nums already scored when a pass is resumed
+    SESSION["session_scored"] = set()   # trial_nums scored by THIS session (may overwrite)
 
     logger.info("Session started: %s (%s) role=%s",
                 SESSION["reviewer_name"], SESSION["initials"], req.role)
@@ -284,8 +290,16 @@ def assign_run():
     log_path = SCORING_LOG_V5
     reviewer  = SESSION["reviewer_name"]
 
+    # Moving on from a partially-scored run: release its lease so the leftover
+    # trials become immediately resumable by the next person.
+    if SESSION.get("log_row") and SESSION.get("rev_num"):
+        try:
+            clear_lease(SESSION["log_row"], SESSION["rev_num"], log_path)
+        except Exception:
+            pass
+
     try:
-        result = claim_scoring_row(reviewer, log_path)
+        result = claim_scoring_row(reviewer, log_path, version=SESSION["version"])
     except ValueError as exc:
         # Expected end-of-queue condition, not a server fault.
         logger.info("No run available for %s: %s", reviewer, exc)
@@ -308,6 +322,8 @@ def assign_run():
     SESSION["run_num"]   = result["run_num"]
     SESSION["rev_num"]   = result["rev_num"]
     SESSION["log_row"]   = result["log_row"]
+    SESSION["scored_trials"]  = result.get("scored_trials", [])
+    SESSION["session_scored"] = set()
     SESSION["current_trial_idx"] = 0
 
     # Load the 25 trials for this run
@@ -335,6 +351,10 @@ def assign_run():
         # data (e.g. log says SNR -11.02, data says -11.2). Release the claim so
         # the row isn't stranded, and report plainly instead of 404-ing.
         release_scoring_row(result["log_row"], result["rev_num"], log_path)
+        try:
+            clear_lease(result["log_row"], result["rev_num"], log_path)
+        except Exception:
+            pass
         for key in ("obs_name", "visit_num", "snr", "dist_cond",
                     "run_num", "rev_num", "log_row"):
             SESSION[key] = None
@@ -350,6 +370,15 @@ def assign_run():
         return AssignRunResponse(ok=False, message=msg)
 
     SESSION["trials"] = trials
+
+    # First unscored trial (resume continues here; fresh runs start at 0).
+    scored_set = set(result.get("scored_trials", []))
+    start_index = 0
+    for i, t in enumerate(trials):
+        if t.get("trial_num", i + 1) not in scored_set:
+            start_index = i
+            break
+    SESSION["current_trial_idx"] = start_index
 
     logger.info(
         "Run assigned: %s visit%s SNR=%s Dist=%s Run=%s rev_num=%s",
@@ -367,6 +396,9 @@ def assign_run():
         rev_num=result["rev_num"],
         log_row=result["log_row"],
         total_trials=len(SESSION["trials"]),
+        scored_trials=result.get("scored_trials", []),
+        start_index=start_index,
+        is_resume=result.get("is_resume", False),
         message=f"Reviewer {result['rev_num']} - run assigned",
     )
 
@@ -481,6 +513,18 @@ def save_trial_route(req: SaveTrialRequest):
     if req.resp_score not in valid_scores:
         raise HTTPException(status_code=422, detail=f"resp_score must be one of {valid_scores}")
 
+    # Handoff guard: never overwrite a trial an EARLIER scorer already recorded
+    # for this pass. Trials this session scored may be re-saved (in-trial
+    # corrections before advancing); trials scored by someone else are locked.
+    already = set(SESSION.get("scored_trials") or [])
+    mine    = SESSION.get("session_scored") or set()
+    if req.trial_num in already and req.trial_num not in mine:
+        raise HTTPException(
+            status_code=409,
+            detail="This trial was already scored by another reviewer on this pass "
+                   "and cannot be changed.",
+        )
+
     # NaN VRT for No Response
     vrt = req.vrt if req.vrt is not None else float("nan")
 
@@ -504,6 +548,14 @@ def save_trial_route(req: SaveTrialRequest):
         logger.error("save_trial failed for trial %s: %s\n%s", req.trial_num, exc, traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to save trial: {exc}")
 
+    # Record that this session scored the trial, and refresh the lease so an
+    # active scorer is never treated as "left" and handed off mid-run.
+    SESSION.setdefault("session_scored", set()).add(req.trial_num)
+    try:
+        set_lease(SESSION["log_row"], rev_num, initials, SCORING_LOG_V5)
+    except Exception:
+        pass
+
     logger.info("Trial saved: obs=%s trial=%s score=%s vrt=%s rev=%s",
                 obs, req.trial_num, req.resp_score, vrt, rev_num)
 
@@ -522,10 +574,26 @@ def complete_run():
     rev_num  = SESSION["rev_num"]
     log_path = SCORING_LOG_V5
 
+    # A pass may have been scored by more than one person (cross-person handoff).
+    # Record EVERY contributor in the scoring log, read from the subject
+    # workbook's per-trial Reviewer# column (the authoritative record).
     try:
-        write_reviewer_initials(reviewer, log_row, rev_num, log_path)
+        prog = get_run_progress(
+            SESSION["obs_name"], SESSION["visit_num"], SESSION["snr"],
+            SESSION["dist_cond"], SESSION["run_num"], SESSION["version"],
+        )
+        contributors = set(prog.get(rev_num, {}).get("contributors", set()))
+    except Exception:
+        contributors = set()
+    contributors.add(SESSION["initials"])          # ensure the finisher is included
+    initials_str = "/".join(sorted({c.strip().upper() for c in contributors if c and c.strip()}))
+    if not initials_str:
+        initials_str = SESSION["initials"]
+
+    try:
+        write_pass_initials(log_row, rev_num, initials_str, log_path)
     except Exception as exc:
-        logger.error("write_reviewer_initials failed: %s\n%s", exc, traceback.format_exc())
+        logger.error("write_pass_initials failed: %s\n%s", exc, traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to write initials: {exc}")
 
     logger.info("Run complete: %s rev%s row=%s", SESSION["obs_name"], rev_num, log_row)
@@ -535,6 +603,8 @@ def complete_run():
                 "rev_num", "log_row", "trials"):
         SESSION[key] = None
     SESSION["trials"] = []
+    SESSION["scored_trials"]  = []
+    SESSION["session_scored"] = set()
     SESSION["current_trial_idx"] = 0
 
     return CompleteRunResponse(ok=True, message="Run complete. Initials written to scoring log.")
@@ -784,9 +854,32 @@ def session_info():
         "current_trial_idx": SESSION.get("current_trial_idx", 0),
     })
 
+@app.post("/api/session/heartbeat")
+def session_heartbeat():
+    """Keep the current pass's lease fresh while the scorer is active, so the
+    handoff logic never treats a working scorer as 'left' and reassigns their
+    run out from under them."""
+    _require_session()
+    log_row = SESSION.get("log_row")
+    rev_num = SESSION.get("rev_num")
+    if log_row and rev_num:
+        try:
+            set_lease(log_row, rev_num, SESSION.get("initials", ""), SCORING_LOG_V5)
+        except Exception:
+            pass
+    return JSONResponse(content={"ok": True})
+
 @app.delete("/api/session")
 def clear_session():
-    """Clear session (logout). Run placeholder is NOT removed - use only after a run is complete."""
+    """Clear session (logout). The run placeholder stays (partial work is kept),
+    but the lease is released so the leftover trials are immediately resumable."""
+    log_row = SESSION.get("log_row")
+    rev_num = SESSION.get("rev_num")
+    if log_row and rev_num:
+        try:
+            clear_lease(log_row, rev_num, SCORING_LOG_V5)
+        except Exception:
+            pass
     SESSION.clear()
     return JSONResponse(content={"ok": True, "message": "Session cleared."})
 

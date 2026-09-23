@@ -9,12 +9,82 @@ Scoring log columns (1-indexed):
 """
 
 import os
+import json
+import time
 import random
 import re
 import openpyxl
 from typing import Optional
 from file_lock import ScoringLogLock
 import config
+from subject_data import get_run_progress
+
+# A claimed-but-unfinished pass holds a "lease". While the lease is fresh, the
+# person is actively scoring and nobody else may take that pass. Once it goes
+# stale (they logged out / closed the tab), the partial pass becomes the top
+# priority for the next person, who resumes from the first unscored trial.
+LEASE_STALE_SECONDS = 90
+
+
+# -- Lease sidecar (next to the scoring log) ----------------------------------
+def _lease_path(log_path: str) -> str:
+    return os.path.join(os.path.dirname(log_path), ".vrt_leases.json")
+
+
+def read_leases(log_path: str) -> dict:
+    try:
+        with open(_lease_path(log_path), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _write_leases(log_path: str, data: dict):
+    try:
+        with open(_lease_path(log_path), "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+def _lease_key(log_row: int, rev_num: int) -> str:
+    return f"{log_row}:{rev_num}"
+
+
+def lease_is_active(leases: dict, log_row: int, rev_num: int,
+                    now: float = None) -> bool:
+    """True if this pass is being actively scored right now (fresh lease)."""
+    rec = leases.get(_lease_key(log_row, rev_num))
+    if not rec:
+        return False
+    now = now if now is not None else time.time()
+    return (now - float(rec.get("ts", 0))) < LEASE_STALE_SECONDS
+
+
+def set_lease(log_row: int, rev_num: int, initials: str, log_path: str = None):
+    """Refresh (or create) the lease for a pass. Call on claim, heartbeat, save."""
+    if log_path is None:
+        log_path = config.SCORING_LOG_V5
+    with ScoringLogLock(log_path):
+        leases = read_leases(log_path)
+        leases[_lease_key(log_row, rev_num)] = {
+            "holder": initials, "ts": time.time()}
+        _write_leases(log_path, leases)
+
+
+def clear_lease(log_row: int, rev_num: int, log_path: str = None):
+    if log_path is None:
+        log_path = config.SCORING_LOG_V5
+    with ScoringLogLock(log_path):
+        leases = read_leases(log_path)
+        if leases.pop(_lease_key(log_row, rev_num), None) is not None:
+            _write_leases(log_path, leases)
+
+
+def _is_real_initials(val) -> bool:
+    """A pass is complete only when its log cell holds real initials -
+    not blank and not a '--XX--' placeholder."""
+    return (not _is_empty(val)) and (not is_placeholder(val)) and str(val).strip() != ""
 
 
 # -- Initials helper (matches compute_initials / computeInitialsFromName) ------
@@ -56,98 +126,168 @@ def _is_empty(val) -> bool:
 
 
 # -- Main: claim a row ---------------------------------------------------------
-def claim_scoring_row(reviewer_name: str, log_path: str = None) -> dict:
-    """
-    Read the scoring log, randomly pick an available row, immediately write
-    a placeholder initials value to claim it (prevents Woody and Buzz
-    grabbing the same row), then return the DataDet fields.
+def _combined_initials(contributors) -> str:
+    """Join every reviewer who contributed to a pass, e.g. {'AN','SB'} -> 'AN/SB'.
+    Sorted for a stable label. The authoritative per-trial record stays in the
+    subject workbook's Reviewer# column; this is just the scoring-log summary."""
+    return "/".join(sorted({str(c).strip().upper() for c in contributors if str(c).strip()}))
 
-    Returns dict with keys:
-        obs_name, visit_num, noise_cond, snr, dist_cond, run_num,
-        rev_num (1 or 2), log_row (1-based Excel row index)
-    Raises ValueError if no row is available.
+
+def claim_scoring_row(reviewer_name: str, log_path: str = None,
+                      version: str = "v5") -> dict:
+    """
+    Pick the next pass for this reviewer and claim it. Priority order:
+
+      1. Resume a partially-scored R1 whose scorer has left (stale lease)
+      2. Resume a partially-scored R2 whose scorer has left (stale lease)
+      3. A fresh R1 (never started)
+      4. A fresh R2 (R1 complete, R2 not started)
+
+    A pass is only handed out if the current reviewer has NOT already scored any
+    trial of the OTHER pass on that run - every trial must be double-coded by two
+    different people. Blinding makes it irrelevant WHO finishes a pass, so a pass
+    may be split across several people; the resume always continues from the first
+    unscored trial and never lets anyone overwrite an earlier scorer's trials.
+
+    Returns dict: obs_name, visit_num, noise_cond, snr, dist_cond, run_num,
+                  rev_num, log_row, scored_trials (list), is_resume (bool)
+    Raises ValueError if nothing is available.
     """
     if log_path is None:
         log_path = config.SCORING_LOG_V5
 
     current_init = compute_initials(reviewer_name)
+    now = time.time()
 
     with ScoringLogLock(log_path):
         wb = openpyxl.load_workbook(log_path)
         ws = wb.active
+        leases = read_leases(log_path)
 
-        # Collect candidate rows: rows 2+ where cols A-F are all non-empty
-        # AND the subject data folder actually exists on disk (skip future subjects)
-        candidates = []
+        # Usable rows: cols A-F present and the subject data folder exists.
+        usable = []
         for row in ws.iter_rows(min_row=2, values_only=False):
-            if all(not _is_empty(row[c].value) for c in range(6)):  # cols A-F
-                try:
-                    obs = str(row[0].value)
-                    vis = int(float(str(row[1].value)))
-                    data_folder = config.get_data_path(obs, vis)
-                    if os.path.isdir(data_folder):
-                        candidates.append(row)
-                except Exception:
-                    pass  # Skip malformed rows
+            if not all(not _is_empty(row[c].value) for c in range(6)):
+                continue
+            try:
+                obs = str(row[0].value)
+                vis = int(float(str(row[1].value)))
+                if os.path.isdir(config.get_data_path(obs, vis)):
+                    usable.append((row, obs, vis))
+            except Exception:
+                pass
 
-        if not candidates:
+        if not usable:
             raise ValueError(
                 "No scoreable runs found. Either all runs are claimed/complete, "
                 "or no subject data folders exist yet."
             )
 
-        # Shuffle and search for R1 (col G empty or missing)
-        r1_candidates = [r for r in candidates
-                         if len(r) <= 6 or _is_empty(r[6].value)]
-        random.shuffle(r1_candidates)
+        prog_cache = {}
+        def progress(row, obs, vis):
+            lr = row[0].row
+            if lr not in prog_cache:
+                prog_cache[lr] = get_run_progress(
+                    obs, vis, row[3].value, int(row[4].value),
+                    int(row[5].value), version)
+            return prog_cache[lr]
 
-        chosen_row = None
-        rev_num = None
+        resume_r1, resume_r2, fresh_r1, fresh_r2 = [], [], [], []
+        log_dirty = False
 
-        for row in r1_candidates:
-            chosen_row = row
-            rev_num = 1
-            break
+        for (row, obs, vis) in usable:
+            lr = row[0].row
+            g = row[6].value if len(row) > 6 else None
+            h = row[7].value if len(row) > 7 else None
 
-        # If no R1, search for R2 (col H empty, col G initials != current)
-        if chosen_row is None:
-            r2_candidates = [
-                r for r in candidates
-                if (len(r) <= 7 or _is_empty(r[7].value))          # H empty/missing
-                and len(r) > 6 and not _is_empty(r[6].value)        # G has R1
-                and not _initials_match(r[6].value, current_init)
-            ]
-            random.shuffle(r2_candidates)
-            for row in r2_candidates:
-                chosen_row = row
-                rev_num = 2
-                break
+            # --- R1 slot ---
+            if _is_empty(g):
+                fresh_r1.append((row, obs, vis))
+                continue
+            if is_placeholder(g):
+                if lease_is_active(leases, lr, 1, now):
+                    continue                      # someone scoring R1 right now
+                pr = progress(row, obs, vis)
+                if len(pr[1]["scored"]) >= 25:
+                    # 25/25 but never finalized (scorer crashed at the end) -> heal
+                    ws.cell(lr, 7).value = _combined_initials(pr[1]["contributors"]) or f"--{current_init}--"
+                    leases.pop(_lease_key(lr, 1), None)
+                    log_dirty = True
+                    g = ws.cell(lr, 7).value      # now real initials -> fall through to R2
+                elif current_init not in pr[1]["contributors"]:
+                    resume_r1.append((row, obs, vis))
+                    continue
+                else:
+                    continue                      # current person already in this R1
+            # g is real initials here -> R1 complete, consider R2
+            if not _is_real_initials(g):
+                continue
 
-        if chosen_row is None:
+            # --- R2 slot (only once R1 is complete) ---
+            pr = progress(row, obs, vis)
+            if current_init in pr[1]["contributors"]:
+                continue                          # can't R2 a run you helped R1
+            if _is_empty(h):
+                fresh_r2.append((row, obs, vis))
+            elif is_placeholder(h):
+                if lease_is_active(leases, lr, 2, now):
+                    continue
+                if len(pr[2]["scored"]) >= 25:
+                    ws.cell(lr, 8).value = _combined_initials(pr[2]["contributors"]) or f"--{current_init}--"
+                    leases.pop(_lease_key(lr, 2), None)
+                    log_dirty = True
+                elif current_init not in pr[2]["contributors"]:
+                    resume_r2.append((row, obs, vis))
+            # h real initials -> R2 complete -> nothing to do
+
+        for bucket in (resume_r1, resume_r2, fresh_r1, fresh_r2):
+            random.shuffle(bucket)
+
+        chosen, rev_num = None, None
+        if resume_r1:
+            chosen, rev_num = resume_r1[0], 1
+        elif resume_r2:
+            chosen, rev_num = resume_r2[0], 2
+        elif fresh_r1:
+            chosen, rev_num = fresh_r1[0], 1
+        elif fresh_r2:
+            chosen, rev_num = fresh_r2[0], 2
+
+        if chosen is None:
+            if log_dirty:
+                wb.save(log_path)
+                _write_leases(log_path, leases)
+            wb.close()
             raise ValueError(
-                "No more runs available to score. "
-                "Either all runs are claimed or you have already scored all eligible runs."
+                "No more runs available to score. Either all runs are claimed, "
+                "actively being scored, or you have already scored all eligible runs."
             )
 
-        # Claim the row immediately by writing a placeholder
-        col_idx = 7 if rev_num == 1 else 8   # G or H (1-indexed)
-        placeholder = f"--{current_init}--"
-        ws.cell(row=chosen_row[0].row, column=col_idx).value = placeholder
+        row, obs, vis = chosen
+        lr = row[0].row
+        col_idx = 6 + rev_num                     # G=7, H=8
+        pr = progress(row, obs, vis)
+        scored_trials = sorted(pr[rev_num]["scored"])
+        is_resume = len(scored_trials) > 0
 
+        # Claim: placeholder in the log cell + a fresh lease under our initials.
+        ws.cell(lr, col_idx).value = f"--{current_init}--"
+        leases[_lease_key(lr, rev_num)] = {"holder": current_init, "ts": time.time()}
         wb.save(log_path)
+        _write_leases(log_path, leases)
         wb.close()
 
-        # Extract DataDet fields (same columns as getdatadetails.m)
-        log_row = chosen_row[0].row  # actual Excel row number
         return {
-            "obs_name":   str(chosen_row[0].value),      # A - cast int->str (Excel stores as number)
-            "visit_num":  int(chosen_row[1].value),      # B
-            "noise_cond": chosen_row[2].value,           # C
-            "snr":        chosen_row[3].value,           # D
-            "dist_cond":  int(chosen_row[4].value),      # E
-            "run_num":    int(chosen_row[5].value),      # F
-            "rev_num":    rev_num,
-            "log_row":    log_row,
+            "obs_name":      str(row[0].value),
+            "visit_num":     int(row[1].value),
+            "noise_cond":    row[2].value,
+            "snr":           row[3].value,
+            "dist_cond":     int(row[4].value),
+            "run_num":       int(row[5].value),
+            "rev_num":       rev_num,
+            "log_row":       lr,
+            "scored_trials": scored_trials,
+            "is_resume":     is_resume,
         }
 
 
@@ -208,6 +348,29 @@ def write_reviewer_initials(reviewer_name: str, log_row: int,
         ws = wb.active
         ws.cell(row=log_row, column=col_idx).value = initials
         wb.save(log_path)
+        wb.close()
+
+
+def write_pass_initials(log_row: int, rev_num: int, initials_str: str,
+                        log_path: str = None):
+    """
+    Finalize a completed pass: write the (possibly combined) contributor
+    initials to the scoring log and clear the lease. Used at run completion so
+    a pass split across several people records everyone who scored it, e.g.
+    'AN/SB'. The per-trial Reviewer# column in the subject workbook remains the
+    authoritative record of exactly who scored which trial.
+    """
+    if log_path is None:
+        log_path = config.SCORING_LOG_V5
+    col_idx = 6 + rev_num  # G=7, H=8, I=9
+    with ScoringLogLock(log_path):
+        wb = openpyxl.load_workbook(log_path)
+        ws = wb.active
+        ws.cell(row=log_row, column=col_idx).value = initials_str
+        wb.save(log_path)
+        leases = read_leases(log_path)
+        if leases.pop(_lease_key(log_row, rev_num), None) is not None:
+            _write_leases(log_path, leases)
         wb.close()
 
 

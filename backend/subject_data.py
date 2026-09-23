@@ -13,7 +13,90 @@ import os
 import csv
 import math
 from typing import Optional
+import openpyxl
 import config
+
+
+def _cell_meaningful(val) -> bool:
+    """A reviewer score cell counts as 'done' only when it holds a real value
+    (not blank, not the 999 sentinel). Mirrors excel_writer._is_meaningful."""
+    if val is None:
+        return False
+    if isinstance(val, str):
+        s = val.strip()
+        return s != "" and s != "999"
+    if isinstance(val, float):
+        return not math.isnan(val) and val != 999
+    if isinstance(val, int):
+        return val != 999
+    return False
+
+
+def get_run_progress(obs_name, visit_num: int, snr, dist_cond,
+                     run_num: int, version: str = "v5") -> dict:
+    """
+    Read the subject's .xlsm and report, for one run, which trials each reviewer
+    has already scored and who scored them. This is the source of truth for
+    cross-person handoff: the scoring log only says a pass is claimed/complete,
+    but the per-trial Reviewer#/RespScore# columns say exactly how far each pass
+    got and which initials contributed.
+
+    Returns:
+        {
+          1: {"scored": set(trial_nums), "contributors": set(initials)},
+          2: {"scored": set(trial_nums), "contributors": set(initials)},
+        }
+    Missing file / columns -> empty sets (treated as nothing scored yet).
+    """
+    empty = {1: {"scored": set(), "contributors": set()},
+             2: {"scored": set(), "contributors": set()}}
+    excel_path = config.get_excel_path(obs_name, visit_num, version)
+    if not os.path.isfile(excel_path):
+        return empty
+
+    try:
+        wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
+        ws = wb.active
+        hdr = [str(c.value).strip() if c.value is not None else "" for c in ws[1]]
+
+        def ci(name):
+            return hdr.index(name) if name in hdr else None
+
+        c_snr, c_dist, c_run, c_trial = ci("SNR"), ci("DistCond"), ci("RunNum"), ci("TrialNum")
+        cols = {
+            1: (ci("RespScore1"), ci("Reviewer1")),
+            2: (ci("RespScore2"), ci("Reviewer2")),
+        }
+        if None in (c_snr, c_dist, c_run, c_trial):
+            wb.close()
+            return empty
+
+        result = {1: {"scored": set(), "contributors": set()},
+                  2: {"scored": set(), "contributors": set()}}
+        for vals in ws.iter_rows(min_row=2, values_only=True):
+            try:
+                if not _float_eq(vals[c_snr], snr):
+                    continue
+                if not _float_eq(vals[c_dist], dist_cond):
+                    continue
+                if int(float(str(vals[c_run]))) != int(run_num):
+                    continue
+                tnum = int(float(str(vals[c_trial])))
+            except Exception:
+                continue
+            for rev, (rs_col, rv_col) in cols.items():
+                if rs_col is None:
+                    continue
+                if _cell_meaningful(vals[rs_col]):
+                    result[rev]["scored"].add(tnum)
+                    if rv_col is not None and vals[rv_col] is not None:
+                        init = str(vals[rv_col]).strip().upper()
+                        if init:
+                            result[rev]["contributors"].add(init)
+        wb.close()
+        return result
+    except Exception:
+        return empty
 
 
 def _float_eq(a, b, tol=1e-6) -> bool:

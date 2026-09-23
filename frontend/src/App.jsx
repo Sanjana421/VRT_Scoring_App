@@ -129,6 +129,7 @@ export default function App(){
   const [trialsScored, setTrialsScored] = useState(0);   // this session
   const [listsScored, setListsScored]   = useState(0);   // runs completed this session
   const [sessionStart, setSessionStart] = useState(null); // Date.now() at login
+  const savedIdxRef = useRef(new Set()); // 0-based indices scored by THIS session on the current run
 
   const showSidebar = session && screen !== "login";
 
@@ -141,6 +142,7 @@ export default function App(){
         body: JSON.stringify({ reviewer_name: name, role, version: "v5", passcode }),
       });
       setSession({ reviewer_name: r.reviewer_name, initials: r.initials, role });
+      savedIdxRef.current = new Set();
       setRun(null); setTrialIdx(0); setTrialData(null); setLastSaved(null);
       setTrialsScored(0); setListsScored(0); setSessionStart(Date.now());
       setScreen("dashboard");
@@ -252,11 +254,17 @@ export default function App(){
   // otherwise claim the next run and open trial 1. Replaces the old Queue page.
   const startScoring = useCallback(async () => {
     if (run) { setScreen("scorer"); return; }
-    const ok = await handleAssignRun();
-    if (!ok) return;
-    await handleLoadTrial(0);
+    clearErr();
+    const r = await apiFetch("/api/session/assign-run", { method: "POST" })
+      .catch(e => { setErr(e.message); return null; });
+    if (!r || !r.ok) { if (r) setErr(r.message || "No runs available."); return; }
+    savedIdxRef.current = new Set();
+    setRun(r);
+    setTrialData(null);
+    // Resume: jump to the first unscored trial instead of trial 1.
+    await handleLoadTrial(r.start_index || 0);
     setScreen("scorer");
-  }, [run, handleAssignRun, handleLoadTrial]);
+  }, [run, handleLoadTrial]);
 
   const roleNav = session?.role === "professor"
     ? [
@@ -330,23 +338,25 @@ export default function App(){
               const ok=await handleSaveTrial(trialNum,vrt,respScore,recheck,cutoff);
               if(!ok) return;
               setTrialsScored(n=>n+1);
-              const nextIdx=trialIdx+1;
-              if(nextIdx>=(run?.total_trials||25)){
-                // All 25 done - complete run and go to "run done" screen
+              savedIdxRef.current.add(trialIdx);
+              const total=run?.total_trials||25;
+              // Trials done before this session (resumed) + trials done now.
+              const scored=new Set((run?.scored_trials||[]).map(tn=>tn-1));
+              savedIdxRef.current.forEach(i=>scored.add(i));
+              // Advance to the first still-unscored trial anywhere in the run.
+              let next=-1;
+              for(let i=0;i<total;i++){ if(!scored.has(i)){ next=i; break; } }
+              if(next===-1){
+                // Every trial in this pass is now scored - complete the run.
                 const done=await handleCompleteRun();
                 if(done){ setListsScored(n=>n+1); apiFetch("/api/status").then(setStatus).catch(()=>{}); setScreen("runDone"); }
               } else {
-                // Auto-advance to next trial (no intermediate screen)
-                await handleLoadTrial(nextIdx);
-                // screen stays on "scorer"
+                await handleLoadTrial(next);
               }
             }}/>}
           {screen==="runDone" && <RunDoneScreen totalTrials={run?.total_trials||25}
             trialsScored={trialsScored}
-            onScoreMore={async()=>{
-              const ok=await handleAssignRun();
-              if(ok){ await handleLoadTrial(0); setScreen("scorer"); }
-            }}
+            onScoreMore={startScoring}
             onDone={()=>setScreen("dashboard")}/>}
           {screen==="recheck"   && <RecheckScreen session={session} flagged={flagged}
             onLoad={handleLoadFlagged} onApproveR3={handleApproveR3} setScreen={setScreen}/>}
@@ -716,6 +726,21 @@ function ScorerScreen({session,run,trialIdx,trialData,totalTrials,onLoadTrial,on
   const playDurRef    = useRef(null); // duration to play (null = to end)
   const animFrameRef  = useRef(null);
 
+  // Trials already scored by a previous person on this pass (cross-person
+  // handoff). Blinded: we never see their scores, we just skip past them, and
+  // the server also rejects any attempt to overwrite them.
+  const lockedSet = new Set(run?.scored_trials || []);
+  const alreadyDone = (run?.scored_trials || []).length;
+
+  // Keep our claim alive while actively scoring so the handoff logic doesn't
+  // treat us as "left" and reassign this run to someone else.
+  useEffect(()=>{
+    const id = setInterval(()=>{
+      apiFetch("/api/session/heartbeat", { method: "POST" }).catch(()=>{});
+    }, 30000);
+    return ()=>clearInterval(id);
+  }, []);
+
   // Load trial on mount / when trialIdx changes
   useEffect(()=>{
     if (!run) return;
@@ -723,6 +748,14 @@ function ScorerScreen({session,run,trialIdx,trialData,totalTrials,onLoadTrial,on
       onLoadTrial(trialIdx);
     }
   }, [trialIdx, run]);
+
+  // Safety net: if we ever land on an already-scored trial, skip forward.
+  useEffect(()=>{
+    if (!trialData) return;
+    if (lockedSet.has(trialData.trial_num) && trialIdx + 1 < totalTrials) {
+      onLoadTrial(trialIdx + 1);
+    }
+  }, [trialData]);
 
   // Reset UI state when new trialData arrives
   useEffect(()=>{
@@ -881,6 +914,7 @@ function ScorerScreen({session,run,trialIdx,trialData,totalTrials,onLoadTrial,on
         <div style={{width:`${progressPct}%`,height:"100%",background:T.blue,borderRadius:2,transition:"width 0.4s"}}/>
       </div>
       {!trialData && <Tag color="gray" small>Loading...</Tag>}
+      {alreadyDone>0 && <Tag color="blue" small>Resumed · {alreadyDone} already scored</Tag>}
     </div>
 
     <div style={{display:"grid",gridTemplateColumns:"1fr 240px",gap:14}}>
@@ -936,7 +970,7 @@ function ScorerScreen({session,run,trialIdx,trialData,totalTrials,onLoadTrial,on
               {playing?"■":"▶"}
             </button>
             <Btn variant="success" style={{padding:"5px 12px",fontSize:12}}
-              onClick={()=>setStartPct(p=>Math.max(0, p - 0.1/winDur))}>↩ −0.1s</Btn>
+              onClick={()=>setStartPct(p=>Math.max(0, p - 0.1/winDur))}>↩ -0.1s</Btn>
             <Btn variant="success" style={{padding:"5px 12px",fontSize:12}}
               onClick={()=>setStartPct(p=>Math.min(endPct-0.01, p + 0.1/winDur))}>+0.1s ↪</Btn>
             <Btn variant="ghost" style={{padding:"5px 12px",fontSize:12}}
@@ -1051,23 +1085,26 @@ function RunDoneScreen({totalTrials,trialsScored,onScoreMore,onDone}){
 
 /* -- S-06 RECHECK / CUTOFF (Professor) -------------------------------- */
 function RecheckScreen({session,flagged,onLoad,onApproveR3}){
-  const [loaded,setLoaded]=useState(false);
   const [selected,setSelected]=useState(new Set());
   const [msg,setMsg]=useState("");
-  useEffect(()=>{if(!loaded){onLoad();setLoaded(true);};},[]);
+  // Load on open and auto-refresh so newly flagged trials appear and
+  // sent-to-R3 trials drop off without a manual reload.
+  useEffect(()=>{ onLoad(); const id=setInterval(onLoad, 20000); return ()=>clearInterval(id); },[]);
   const sc=s=>s==="Correct"?"#4ECFA0":s==="Incorrect"?"#F08080":T.text3;
   const toggleAll=()=>setSelected(selected.size===flagged.length?new Set():new Set(flagged.map((_,i)=>i)));
-  const handleApprove=async()=>{
-    const toApprove=flagged.filter((_,i)=>selected.has(i));
+  const handleApprove=async(items)=>{
+    const toApprove=items||flagged.filter((_,i)=>selected.has(i));
+    if(!toApprove.length) return;
     const r=await onApproveR3(toApprove);
-    if(r) setMsg(`${r.added} trial(s) added to R3 Rechecks log.`);
+    if(r){ setMsg(`${r.added} trial(s) sent to R3. They have been removed from this list.`);
+           setSelected(new Set()); onLoad(); }
   };
   const reasonColor=r=>r.includes("mismatch")?"red":r.includes("VRT")?"amber":"purple";
   const cell=(score,vrt)=><span><span style={{color:sc(score)}}>{score||"-"}</span>
     {vrt!=null&&<span style={{color:T.text2}}> · {vrt.toFixed(3)}s</span>}</span>;
   const mismatchCount=flagged.filter(f=>(f.reasons||[]).some(r=>r.includes("mismatch"))).length;
   const vrtCount=flagged.filter(f=>(f.reasons||[]).some(r=>r.includes("VRT"))).length;
-  const GRID="30px 60px 44px 40px 1.4fr 1fr 1fr";
+  const GRID="28px 54px 38px 150px 34px 1.1fr 0.9fr 0.9fr";
   return <div>
     <SectionHeader title="Trials needing a 3rd coder"
       sub="Trials where R1 and R2 disagree per the study rules. Select to send to R3."/>
@@ -1093,7 +1130,7 @@ function RecheckScreen({session,flagged,onLoad,onApproveR3}){
               display:"grid",gridTemplateColumns:GRID,
               gap:6,fontSize:10,color:T.text3,textTransform:"uppercase",letterSpacing:"0.4px",alignItems:"center"}}>
               <input type="checkbox" onChange={toggleAll} checked={selected.size===flagged.length&&flagged.length>0}/>
-              <span>Subject</span><span>Trial</span><span>Run</span>
+              <span>Subject</span><span>Trial</span><span>Trial ID</span><span>Run</span>
               <span>Reason</span><span>R1</span><span>R2</span>
             </div>
             {flagged.map((item,i)=>(
@@ -1105,6 +1142,7 @@ function RecheckScreen({session,flagged,onLoad,onApproveR3}){
                   const s=new Set(selected);s.has(i)?s.delete(i):s.add(i);setSelected(s);}}/>
                 <span style={{color:"#6EB3FF",fontWeight:500}}>{item.obs_name}</span>
                 <span style={{color:T.text2}}>T{item.trial_num}</span>
+                <span style={{color:T.text1,fontFamily:"ui-monospace,monospace",fontSize:11}}>{item.trial_id||"-"}</span>
                 <span style={{color:T.text2}}>R{item.run_num}</span>
                 <div style={{display:"flex",gap:3,flexWrap:"wrap"}}>
                   {(item.reasons||[]).map((r,j)=><Tag key={j} color={reasonColor(r)} small>{r}</Tag>)}
@@ -1115,10 +1153,10 @@ function RecheckScreen({session,flagged,onLoad,onApproveR3}){
             ))}
           </Card>
           <div style={{marginTop:14,display:"flex",gap:10}}>
-            <Btn variant="amber" disabled={selected.size===0} onClick={handleApprove}>
+            <Btn variant="amber" disabled={selected.size===0} onClick={()=>handleApprove()}>
               Send {selected.size} selected → R3 log
             </Btn>
-            <Btn variant="ghost" onClick={()=>{setSelected(new Set(flagged.map((_,i)=>i)));handleApprove();}}>
+            <Btn variant="ghost" onClick={()=>handleApprove(flagged)}>
               Send all → R3 log
             </Btn>
             <Btn variant="ghost" onClick={()=>{onLoad();setMsg("");}}>Refresh</Btn>

@@ -69,6 +69,38 @@ def _norm_score(s):
     return str(s or "").strip().lower()
 
 
+def _scored(s):
+    """True only if a reviewer actually recorded a score for this trial.
+    Blank/999 means not scored; a real value like 'Correct' or 'Unsure' counts."""
+    return _norm_score(s) not in ("", "999")
+
+
+def _sent_to_r3_keys(rechecks_path=None):
+    """Set of (obs, snr, dist, run, trial) already written to the Rechecks (R3)
+    log, so the professor's list can drop trials once they've been sent."""
+    if rechecks_path is None:
+        rechecks_path = config.RECHECKS_LOG_V5
+    keys = set()
+    if not rechecks_path or not os.path.isfile(rechecks_path):
+        return keys
+    try:
+        wb = openpyxl.load_workbook(rechecks_path, read_only=True)
+        ws = wb.active
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if not row or row[0] is None:
+                continue
+            try:
+                obs = str(int(row[0])) if isinstance(row[0], (int, float)) else str(row[0])
+                keys.add((obs, round(float(row[3]), 4), int(float(row[4])),
+                          int(float(row[5])), int(float(row[6]))))
+            except Exception:
+                continue
+        wb.close()
+    except Exception:
+        pass
+    return keys
+
+
 def needs_third_coder(recheck1, recheck2, resp_score1, resp_score2, vrt1, vrt2):
     """Return a list of reason strings (empty => no 3rd coder needed)."""
     reasons = []
@@ -83,7 +115,11 @@ def needs_third_coder(recheck1, recheck2, resp_score1, resp_score2, vrt1, vrt2):
     if rc1 or rc2:
         reasons.append("recheck flag")
 
+    # A real voice onset is always > 0. A stored 0 (or blank) means "no VRT"
+    # (e.g. No Response), so it must NOT trip the VRT rules.
     v1, v2 = _to_float(vrt1), _to_float(vrt2)
+    v1 = v1 if (v1 is not None and v1 > 0) else None
+    v2 = v2 if (v2 is not None and v2 > 0) else None
     if (v1 is not None and v1 < VRT_MIN) or (v2 is not None and v2 < VRT_MIN):
         reasons.append(f"VRT < {VRT_MIN}")
     if v1 is not None and v2 is not None and abs(v1 - v2) > VRT_DISCREPANCY:
@@ -110,6 +146,7 @@ def get_flagged_trials(log_path=None) -> list:
         log_path = config.SCORING_LOG_V5
 
     flagged = []
+    sent = _sent_to_r3_keys()   # trials already sent to R3 - hide them here
     wb_log = openpyxl.load_workbook(log_path, read_only=True)
     ws_log = wb_log.active
 
@@ -138,7 +175,7 @@ def get_flagged_trials(log_path=None) -> list:
 
         flagged += _scan_excel_for_flags(
             excel_path, obs_name, visit_num, noise_cond, snr,
-            dist_cond, run_num, r1_str, r2_str, r1_done, r2_done
+            dist_cond, run_num, r1_str, r2_str, r1_done, r2_done, sent
         )
 
     wb_log.close()
@@ -147,8 +184,10 @@ def get_flagged_trials(log_path=None) -> list:
 
 def _scan_excel_for_flags(excel_path, obs_name, visit_num, noise_cond,
                            snr, dist_cond, run_num, r1_init, r2_init,
-                           r1_done=True, r2_done=True):
+                           r1_done=True, r2_done=True, sent=None):
     results = []
+    sent = sent or set()
+    obs_key = str(int(obs_name)) if isinstance(obs_name, (int, float)) else str(obs_name)
     try:
         wb = openpyxl.load_workbook(excel_path, read_only=True)
         ws = wb.active
@@ -197,6 +236,18 @@ def _scan_excel_for_flags(excel_path, obs_name, visit_num, noise_cond,
             resp_score2 = vals[rs2c] if rs2c is not None else None
             vrt2        = vals[vt2c] if vt2c is not None else None
 
+            # Only consider a trial actually scored by BOTH reviewers. A blank
+            # score means that reviewer hasn't done this trial yet - it is not a
+            # disagreement, so it must not appear on the PI's list.
+            if not (_scored(resp_score1) and _scored(resp_score2)):
+                continue
+
+            trial_num = int(float(str(vals[tn_col])))
+            # Already sent to R3 -> drop from the PI's list.
+            if (obs_key, round(float(snr), 4), int(float(dist_cond)),
+                    int(float(run_num)), trial_num) in sent:
+                continue
+
             # Apply the study's auto third-coder rules (R1 vs R2).
             reasons = needs_third_coder(recheck1, recheck2,
                                         resp_score1, resp_score2, vrt1, vrt2)
@@ -208,8 +259,11 @@ def _scan_excel_for_flags(excel_path, obs_name, visit_num, noise_cond,
                     "snr":         snr,
                     "dist_cond":   dist_cond,
                     "run_num":     run_num,
-                    "trial_num":   int(float(str(vals[tn_col]))),
-                    "stim_word":   vals[sw_col] if sw_col is not None else "",
+                    "trial_num":   trial_num,
+                    # Identifier in the dataset's own naming convention
+                    # (same as the WAV filenames): obs_snr_dist_run_trial.
+                    "trial_id":    f"{obs_name}_{config._format_snr(snr)}_"
+                                   f"{int(float(dist_cond))}_{int(float(run_num))}_{trial_num}",
                     "r1_initials": r1_init,
                     "r2_initials": r2_init,
                     "reasons":     reasons,
