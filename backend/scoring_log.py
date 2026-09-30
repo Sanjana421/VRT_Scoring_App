@@ -200,44 +200,41 @@ def claim_scoring_row(reviewer_name: str, log_path: str = None,
             g = row[6].value if len(row) > 6 else None
             h = row[7].value if len(row) > 7 else None
 
+            # A pass is complete ONLY when its cell holds real initials. Blank or
+            # a legacy '--XX--' placeholder both mean "not complete". In-progress
+            # is tracked by the lease, never by writing to the log cell (MATLAB
+            # keeps this column as plain initials, so we do too).
             # --- R1 slot ---
-            if _is_empty(g):
-                fresh_r1.append((row, obs, vis))
-                continue
-            if is_placeholder(g):
+            if not _is_real_initials(g):
                 if lease_is_active(leases, lr, 1, now):
-                    continue                      # someone scoring R1 right now
+                    continue                      # someone is scoring R1 right now
                 pr = progress(row, obs, vis)
-                if len(pr[1]["scored"]) >= 25:
-                    # 25/25 but never finalized (scorer crashed at the end) -> heal
-                    ws.cell(lr, 7).value = _combined_initials(pr[1]["contributors"]) or f"--{current_init}--"
+                n1 = len(pr[1]["scored"])
+                if n1 >= 25:
+                    # All 25 scored but never finalized (crash, or a legacy
+                    # placeholder) -> write clean initials now; R1 is complete.
+                    ws.cell(lr, 7).value = _combined_initials(pr[1]["contributors"]) or current_init
                     leases.pop(_lease_key(lr, 1), None)
                     log_dirty = True
-                    g = ws.cell(lr, 7).value      # now real initials -> fall through to R2
-                elif current_init not in pr[1]["contributors"]:
-                    resume_r1.append((row, obs, vis))
-                    continue
+                    # fall through to consider R2
                 else:
-                    continue                      # current person already in this R1
-            # g is real initials here -> R1 complete, consider R2
-            if not _is_real_initials(g):
-                continue
+                    (resume_r1 if n1 > 0 else fresh_r1).append((row, obs, vis))
+                    continue
 
-            # --- R2 slot (only once R1 is complete) ---
+            # R1 is complete here -> consider R2.
             pr = progress(row, obs, vis)
             if current_init in pr[1]["contributors"]:
-                continue                          # can't R2 a run you helped R1
-            if _is_empty(h):
-                fresh_r2.append((row, obs, vis))
-            elif is_placeholder(h):
+                continue                          # can't R2 a run you helped score as R1
+            if not _is_real_initials(h):
                 if lease_is_active(leases, lr, 2, now):
-                    continue
-                if len(pr[2]["scored"]) >= 25:
-                    ws.cell(lr, 8).value = _combined_initials(pr[2]["contributors"]) or f"--{current_init}--"
+                    continue                      # someone is scoring R2 right now
+                n2 = len(pr[2]["scored"])
+                if n2 >= 25:
+                    ws.cell(lr, 8).value = _combined_initials(pr[2]["contributors"]) or current_init
                     leases.pop(_lease_key(lr, 2), None)
                     log_dirty = True
-                elif current_init not in pr[2]["contributors"]:
-                    resume_r2.append((row, obs, vis))
+                else:
+                    (resume_r2 if n2 > 0 else fresh_r2).append((row, obs, vis))
             # h real initials -> R2 complete -> nothing to do
 
         for bucket in (resume_r1, resume_r2, fresh_r1, fresh_r2):
@@ -265,15 +262,16 @@ def claim_scoring_row(reviewer_name: str, log_path: str = None,
 
         row, obs, vis = chosen
         lr = row[0].row
-        col_idx = 6 + rev_num                     # G=7, H=8
         pr = progress(row, obs, vis)
         scored_trials = sorted(pr[rev_num]["scored"])
         is_resume = len(scored_trials) > 0
 
-        # Claim: placeholder in the log cell + a fresh lease under our initials.
-        ws.cell(lr, col_idx).value = f"--{current_init}--"
+        # Claim via the lease ONLY. The scoring-log cell stays exactly as MATLAB
+        # leaves it (blank until real initials are written on completion) - no
+        # '--XX--' placeholder is ever written.
         leases[_lease_key(lr, rev_num)] = {"holder": current_init, "ts": time.time()}
-        wb.save(log_path)
+        if log_dirty:
+            wb.save(log_path)                     # persist any auto-heal finalizations
         _write_leases(log_path, leases)
         wb.close()
 

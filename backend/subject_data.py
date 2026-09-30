@@ -204,3 +204,64 @@ def get_all_trials(obs_name, visit_num: int, bundle_version: str,
 
     trials.sort(key=lambda x: x["trial_num"])
     return trials
+
+
+# The 18 columns of the subject data bundle, in order, exactly as scoreVRT_v5.m
+# overwrites them (expectedVars). MATLAB reads this whole row and writes it to
+# the output workbook, so we must too - otherwise only the match-key columns get
+# saved and the rest of the row is blank ("half the data").
+EXPECTED_VARS = ["ObsName", "TimeStamp", "VisitNum", "WordLevel", "NoiseCond",
+                 "SNR", "DistCond", "DistLevel", "DistTime", "RunNum", "TrialNum",
+                 "StimTalker", "ListNum", "StimWord", "DistPresent", "DistItem",
+                 "TargetSide", "Response"]
+# Columns MATLAB infers as numeric (the rest stay text).
+_NUMERIC_IDX = {0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16}
+
+
+def _coerce(idx, raw):
+    s = (raw or "").strip()
+    if idx in _NUMERIC_IDX and s != "":
+        try:
+            f = float(s)
+            return int(f) if f == int(f) else f
+        except Exception:
+            return s
+    return s
+
+
+def get_full_trial_row(obs_name, visit_num: int, bundle_version: str,
+                       snr, dist_cond, run_num: int, trial_num: int,
+                       version: str = "v5") -> Optional[dict]:
+    """
+    Return the FULL 18-column metadata row for one trial, read positionally from
+    the subject data bundle (DistVRT_<ver>_<obs>) - the same source scoreVRT_v5.m
+    reads. Keys are EXPECTED_VARS. Returns None if the bundle or row is missing,
+    so the caller can fall back to the match keys.
+    """
+    base = config.get_subject_data_path(obs_name, visit_num, bundle_version, version)
+    data_file = None
+    for c in [base, base + ".txt", base + ".csv", base + ".xlsx", base + ".xlsm"]:
+        if os.path.isfile(c):
+            data_file = c
+            break
+    if data_file is None:
+        return None
+
+    try:
+        with open(data_file, "r", newline="", encoding="utf-8-sig") as f:
+            reader = csv.reader(f)
+            next(reader, None)  # header (names are overwritten by position anyway)
+            for row in reader:
+                if len(row) < 18:
+                    continue
+                try:
+                    if not (_float_eq(row[5], snr) and _float_eq(row[6], dist_cond)
+                            and int(float(row[9])) == int(run_num)
+                            and int(float(row[10])) == int(trial_num)):
+                        continue
+                except (ValueError, IndexError):
+                    continue
+                return {EXPECTED_VARS[i]: _coerce(i, row[i]) for i in range(18)}
+    except Exception:
+        return None
+    return None

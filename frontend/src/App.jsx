@@ -606,20 +606,22 @@ function WaveCanvas({samples, startPct, endPct, onStartPct, onEndPct,
     ctx.fillRect(sx, 0, ex - sx, H);
 
     if (viewSamples.length > 1) {
-      const drawHalf = (sign) => {
-        ctx.beginPath();
-        for (let i = 0; i < W; i++) {
-          const si = Math.floor((i / W) * viewSamples.length);
-          const amp = viewSamples[si] ?? 0;
-          const y = H / 2 + sign * amp * (H * 0.44);
-          i === 0 ? ctx.moveTo(i, y) : ctx.lineTo(i, y);
-        }
-        ctx.strokeStyle = "rgba(43,127,224,0.6)";
-        ctx.lineWidth = 1.2;
-        ctx.stroke();
-      };
-      drawHalf(1);
-      drawHalf(-1);
+      // Single continuous trace through the signed samples, exactly like
+      // MATLAB's plot(wave): connect the actual sample points with straight
+      // lines. When zoomed in (few samples across the canvas) this stays a
+      // smooth continuous wave rather than stepping per pixel into blocks.
+      const n = viewSamples.length;
+      ctx.beginPath();
+      for (let k = 0; k < n; k++) {
+        const x = (k / (n - 1)) * W;
+        const amp = viewSamples[k] ?? 0;
+        const y = H / 2 - amp * (H * 0.44);   // +amp up, like MATLAB
+        k === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      }
+      ctx.strokeStyle = "rgba(43,127,224,0.85)";
+      ctx.lineWidth = 1.2;
+      ctx.lineJoin = "round";
+      ctx.stroke();
     } else {
       ctx.fillStyle = T.text3;
       ctx.font = "12px monospace";

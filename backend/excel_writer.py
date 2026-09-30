@@ -14,6 +14,7 @@ import math
 import openpyxl
 from file_lock import ScoringLogLock   # same lock mechanism
 import config
+import subject_data
 
 # Reviewer column sets - must match MATLAB reorderReviewerBlock
 REVIEWER_COLS = [
@@ -97,9 +98,17 @@ def save_trial(obs_name, visit_num: int, snr, dist_cond,
         "TrialNum": trial_num,
     }
 
+    # Full 18-column metadata row from the subject data bundle, exactly as
+    # scoreVRT_v5.m reads it. Written verbatim when we have to create the file
+    # or append a new row, so the whole row is saved - not just the match keys.
+    # Falls back to the 5 keys only if the bundle can't be read.
+    full_meta = subject_data.get_full_trial_row(
+        obs_name, visit_num, version, snr, dist_cond, run_num, trial_num, version
+    ) or dict(match_data)
+
     with ScoringLogLock(excel_path):
         if not os.path.isfile(excel_path):
-            _create_new_file(excel_path, match_data, incoming)
+            _create_new_file(excel_path, full_meta, incoming)
             return
 
         wb = openpyxl.load_workbook(excel_path, keep_vba=True)
@@ -121,8 +130,9 @@ def save_trial(obs_name, visit_num: int, snr, dist_cond,
                 break
 
         if match_row is None:
-            # Append new row (shouldn't normally happen - data file pre-exists)
-            _append_row(ws, header, match_data, incoming)
+            # Append a full row (subject data file pre-exists in normal use;
+            # this writes every metadata column, matching appendRowToExcel.m).
+            _append_row(ws, header, full_meta, incoming)
         else:
             _update_row(ws, header, match_row, incoming)
 
