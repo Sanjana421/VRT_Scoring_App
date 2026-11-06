@@ -5,14 +5,14 @@ Matches on ObsName + SNR + DistCond + RunNum + TrialNum.
 Updates ONLY reviewer columns (Reviewer1/VRT1/RespScore1/Recheck1/Cutoff1
 and equivalents for R2, R3).  Never touches columns 1-18.
 
-Uses openpyxl so it preserves the .xlsm format.
+Uses openpyxl to read and write standard .xlsx workbooks.
 File-locks the Excel file before read+write.
 """
 
 import os
 import math
 import openpyxl
-from file_lock import ScoringLogLock   # same lock mechanism
+from file_lock import ScoringLogLock
 import config
 import subject_data
 
@@ -25,8 +25,10 @@ REVIEWER_COLS = [
 
 MATCH_KEYS = ["ObsName", "SNR", "DistCond", "RunNum", "TrialNum"]
 
-STRING_COLS = {"Reviewer1", "RespScore1", "Reviewer2", "RespScore2",
-               "Reviewer3", "RespScore3"}
+STRING_COLS = {
+    "Reviewer1", "RespScore1", "Reviewer2", "RespScore2",
+    "Reviewer3", "RespScore3",
+}
 
 
 def _is_meaningful(val) -> bool:
@@ -55,7 +57,8 @@ def _row_matches(header: list, row_vals: list, match_data: dict) -> bool:
             return False
         col = header.index(key)
         cell_val = row_vals[col] if col < len(row_vals) else None
-        target   = match_data.get(key)
+        target = match_data.get(key)
+
         if key in ("SNR", "DistCond"):
             if not _float_eq(cell_val, target):
                 return False
@@ -66,44 +69,63 @@ def _row_matches(header: list, row_vals: list, match_data: dict) -> bool:
             except Exception:
                 if str(cell_val).strip() != str(target).strip():
                     return False
+
     return True
 
 
-def save_trial(obs_name, visit_num: int, snr, dist_cond,
-               run_num: int, trial_num: int,
-               rev_num: int, reviewer_initials: str,
-               vrt: float, resp_score: str,
-               recheck: int, cutoff: int,
-               version: str = "v5"):
+def save_trial(
+    obs_name,
+    visit_num: int,
+    snr,
+    dist_cond,
+    run_num: int,
+    trial_num: int,
+    rev_num: int,
+    reviewer_initials: str,
+    vrt: float,
+    resp_score: str,
+    recheck: int,
+    cutoff: int,
+    version: str = "v5",
+):
     """
-    Write one trial's scoring data to the subject's .xlsm file.
-    Creates the file (with correct headers) if it doesn't exist yet.
+    Write one trial's scoring data to the subject's .xlsx file.
+    Creates the file with the correct headers if it doesn't exist yet.
     """
     excel_path = config.get_excel_path(obs_name, visit_num, version)
 
-    # Build the incoming data dict
     suffix = str(rev_num)
     incoming = {
-        f"Reviewer{suffix}":  reviewer_initials,
+        f"Reviewer{suffix}": reviewer_initials,
         f"RespScore{suffix}": resp_score,
-        f"VRT{suffix}":       None if (vrt is None or (isinstance(vrt, float) and math.isnan(vrt))) else vrt,
-        f"Recheck{suffix}":   float(recheck),
-        f"Cutoff{suffix}":    float(cutoff),
+        f"VRT{suffix}": (
+            None
+            if vrt is None or (isinstance(vrt, float) and math.isnan(vrt))
+            else vrt
+        ),
+        f"Recheck{suffix}": float(recheck),
+        f"Cutoff{suffix}": float(cutoff),
     }
+
     match_data = {
-        "ObsName":  obs_name,
-        "SNR":      snr,
+        "ObsName": obs_name,
+        "SNR": snr,
         "DistCond": dist_cond,
-        "RunNum":   run_num,
+        "RunNum": run_num,
         "TrialNum": trial_num,
     }
 
-    # Full 18-column metadata row from the subject data bundle, exactly as
-    # scoreVRT_v5.m reads it. Written verbatim when we have to create the file
-    # or append a new row, so the whole row is saved - not just the match keys.
-    # Falls back to the 5 keys only if the bundle can't be read.
+    # Copy the full 18-column metadata row from the collector's trial data file
+    # when available. Fall back to the match keys if it cannot be read.
     full_meta = subject_data.get_full_trial_row(
-        obs_name, visit_num, version, snr, dist_cond, run_num, trial_num, version
+        obs_name,
+        visit_num,
+        version,
+        snr,
+        dist_cond,
+        run_num,
+        trial_num,
+        version,
     ) or dict(match_data)
 
     with ScoringLogLock(excel_path):
@@ -111,27 +133,27 @@ def save_trial(obs_name, visit_num: int, snr, dist_cond,
             _create_new_file(excel_path, full_meta, incoming)
             return
 
-        wb = openpyxl.load_workbook(excel_path, keep_vba=True)
+        wb = openpyxl.load_workbook(excel_path)
         ws = wb.active
 
-        # Read header row
-        header = [str(c.value).strip() if c.value else ""
-                  for c in ws[1]]
+        header = [
+            str(cell.value).strip() if cell.value else ""
+            for cell in ws[1]
+        ]
 
-        # Ensure reviewer columns exist in header
         header, ws = _ensure_reviewer_cols(header, ws)
 
-        # Find matching row
         match_row = None
-        for r_idx in range(2, ws.max_row + 1):
-            row_vals = [ws.cell(r_idx, c).value for c in range(1, len(header) + 1)]
+        for row_index in range(2, ws.max_row + 1):
+            row_vals = [
+                ws.cell(row_index, col).value
+                for col in range(1, len(header) + 1)
+            ]
             if _row_matches(header, row_vals, match_data):
-                match_row = r_idx
+                match_row = row_index
                 break
 
         if match_row is None:
-            # Append a full row (subject data file pre-exists in normal use;
-            # this writes every metadata column, matching appendRowToExcel.m).
             _append_row(ws, header, full_meta, incoming)
         else:
             _update_row(ws, header, match_row, incoming)
@@ -141,22 +163,17 @@ def save_trial(obs_name, visit_num: int, snr, dist_cond,
 
 
 def _ensure_reviewer_cols(header: list, ws) -> tuple:
-    """Add any missing reviewer columns to the worksheet header."""
-    changed = False
+    """Add any missing reviewer columns to the header."""
     for col_name in REVIEWER_COLS:
         if col_name not in header:
             header.append(col_name)
-            col_num = len(header)
-            ws.cell(1, col_num).value = col_name
-            changed = True
+            ws.cell(1, len(header)).value = col_name
     return header, ws
 
 
 def _update_row(ws, header: list, row_idx: int, incoming: dict):
     for col_name, value in incoming.items():
-        if col_name not in header:
-            continue
-        if not _is_meaningful(value):
+        if col_name not in header or not _is_meaningful(value):
             continue
         col_num = header.index(col_name) + 1
         ws.cell(row_idx, col_num).value = value
@@ -171,19 +188,15 @@ def _append_row(ws, header: list, match_data: dict, incoming: dict):
 
 
 def _create_new_file(excel_path: str, match_data: dict, incoming: dict):
-    """
-    Create a brand-new subject workbook with the standard header.
-    MATLAB parity: appendRowToExcel.m does the same when the file is missing
-    (writetable on an empty table, which also produces no VBA). Excel may warn
-    about the .xlsm extension on first open - logged so it is never a surprise.
-    """
+    """Create a new .xlsx subject workbook with the standard header."""
     import logging
-    logging.getLogger("vrt").warning(
-        "Subject workbook did not exist; creating a new one at %s "
-        "(no VBA project - Excel may warn about the .xlsm extension).",
+
+    logging.getLogger("vrt").info(
+        "Subject workbook did not exist; creating a new .xlsx file at %s",
         excel_path,
     )
     os.makedirs(os.path.dirname(excel_path), exist_ok=True)
+
     wb = openpyxl.Workbook()
     ws = wb.active
 
@@ -193,13 +206,13 @@ def _create_new_file(excel_path: str, match_data: dict, incoming: dict):
         "ListNum", "StimWord", "DistPresent", "DistItem", "TargetSide", "Response",
     ] + REVIEWER_COLS
 
-    for i, h in enumerate(all_headers, 1):
-        ws.cell(1, i).value = h
+    for col_num, header in enumerate(all_headers, 1):
+        ws.cell(1, col_num).value = header
 
     row_data = {**match_data, **incoming}
-    for i, h in enumerate(all_headers, 1):
-        if h in row_data:
-            ws.cell(2, i).value = row_data[h]
+    for col_num, header in enumerate(all_headers, 1):
+        if header in row_data:
+            ws.cell(2, col_num).value = row_data[header]
 
     wb.save(excel_path)
     wb.close()
